@@ -1,6 +1,6 @@
 # Supabase Open Datasets
 
-Public, versioned embedding datasets hosted in Vector Buckets — queryable via SQL and REST.
+Public, versioned embedding datasets hosted in S3-compatible buckets — queryable via Edge Functions and REST.
 
 ## Overview
 
@@ -8,43 +8,50 @@ Supabase Open Datasets provides pre-crawled, pre-chunked, and pre-embedded datas
 
 **Key Features:**
 - **Instant RAG** — No crawling, chunking, or embedding required
-- **SQL Native** — Query with pgvector via standard PostgreSQL
-- **REST API** — Access embeddings via PostgREST
+- **S3 Native** — Parquet files in Analytics Buckets and Vector Buckets
+- **Edge Functions** — Low-latency semantic search at the edge
 - **Immutable Versions** — Reproducible retrieval with checksums
 - **Permissive Licenses** — SPDX-compliant, per-record attribution
 
 ## Quick Start
 
-### 1. Connect to a Dataset
-
-```sql
--- Enable the extension
-CREATE EXTENSION IF NOT EXISTS vector;
-
--- Link to the public dataset
-SELECT supabase.link_dataset('oss-docs', version := 'latest');
-```
-
-### 2. Query with Semantic Search
-
-```sql
--- Find relevant documentation
-SELECT
-  content,
-  metadata->>'source' AS source,
-  1 - (embedding <=> query_embedding) AS similarity
-FROM oss_docs.chunks
-ORDER BY embedding <=> query_embedding
-LIMIT 10;
-```
-
-### 3. Use the REST API
+### 1. Search via REST API
 
 ```bash
-curl -X POST 'https://api.supabase.com/datasets/v1/oss-docs/query' \
-  -H 'apikey: YOUR_ANON_KEY' \
+curl -X POST 'https://datasets.supabase.co/v1/oss-docs/search' \
+  -H 'Authorization: Bearer YOUR_ANON_KEY' \
   -H 'Content-Type: application/json' \
-  -d '{"query": "how to create a table", "limit": 10}'
+  -d '{
+    "query": "how to create a table",
+    "limit": 10
+  }'
+```
+
+### 2. Use in Your Edge Function
+
+```typescript
+import { searchDataset } from 'https://esm.sh/@supabase/datasets'
+
+Deno.serve(async (req) => {
+  const { query } = await req.json()
+
+  const results = await searchDataset('oss-docs', {
+    query,
+    limit: 10,
+    version: 'latest'
+  })
+
+  return Response.json({ results })
+})
+```
+
+### 3. Direct Parquet Access via DuckDB
+
+```sql
+-- Query embeddings directly from S3
+SELECT chunk_id, chunk_content, embedding
+FROM read_parquet('s3://vector-bucket/oss-docs/v2024.12.1/embeddings.parquet')
+LIMIT 10;
 ```
 
 ## Available Datasets
@@ -54,7 +61,6 @@ curl -X POST 'https://api.supabase.com/datasets/v1/oss-docs/query' \
 | Dataset | Description | Records | Embedder | License | Sponsor |
 |---------|-------------|---------|----------|---------|---------|
 | `oss-docs` | OSS documentation (React, Vue, Next.js, etc.) | ~2M | text-embedding-3-small | MIT/Apache | [Firecrawl](https://firecrawl.dev) |
-| `postgres-mailing-lists` | PostgreSQL mailing list archives | ~1.5M | text-embedding-3-small | PostgreSQL | Supabase |
 | `hacker-news` | HN stories, comments, and discussions | ~5M | text-embedding-3-small | CC BY-NC | [Firecrawl](https://firecrawl.dev) |
 | `arxiv-abstracts` | arXiv paper abstracts and metadata | ~2.3M | text-embedding-3-small | CC0 | Supabase |
 
@@ -101,22 +107,25 @@ curl -X POST 'https://api.supabase.com/datasets/v1/oss-docs/query' \
                     ▼                           ▼
          ┌──────────────────┐        ┌──────────────────┐
          │   Analytics       │        │   Vector         │
-         │   Buckets         │        │   Buckets        │
-         │   (Raw Data)      │        │   (Embeddings)   │
+         │   Buckets (S3)    │        │   Buckets (S3)   │
+         │                   │        │                   │
+         │  • Raw documents  │        │  • Embeddings     │
+         │  • Metadata       │        │  • Chunk content  │
+         │  • Parquet format │        │  • Parquet format │
          └────────┬─────────┘        └────────┬─────────┘
                   │                           │
                   └─────────────┬─────────────┘
                                 ▼
                     ┌──────────────────┐
-                    │    pgvector      │
-                    │   HNSW/IVFFLAT   │
+                    │  Edge Functions   │
+                    │  (Search API)     │
                     └────────┬─────────┘
                              │
               ┌──────────────┼──────────────┐
               ▼              ▼              ▼
         ┌──────────┐  ┌──────────┐  ┌──────────┐
-        │   SQL    │  │  REST    │  │  Edge    │
-        │  Client  │  │  API     │  │ Functions│
+        │  REST    │  │  SDK     │  │  DuckDB  │
+        │  API     │  │  Client  │  │  Direct  │
         └──────────┘  └──────────┘  └──────────┘
 ```
 
@@ -124,21 +133,17 @@ curl -X POST 'https://api.supabase.com/datasets/v1/oss-docs/query' \
 
 Each dataset follows semantic versioning with immutable snapshots:
 
-```sql
--- List available versions
-SELECT * FROM supabase.dataset_versions('oss-docs');
+```bash
+# List available versions
+curl 'https://datasets.supabase.co/v1/oss-docs/versions'
 
--- Pin to a specific version
-SELECT supabase.link_dataset('oss-docs', version := 'v2024.12.1');
+# Search a specific version
+curl -X POST 'https://datasets.supabase.co/v1/oss-docs/search?version=v2024.12.1' \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "authentication"}'
 
--- Check version metadata
-SELECT
-  version,
-  record_count,
-  embedding_model,
-  checksum,
-  created_at
-FROM supabase.dataset_metadata('oss-docs');
+# Get dataset metadata
+curl 'https://datasets.supabase.co/v1/oss-docs/metadata'
 ```
 
 ## Sponsorship

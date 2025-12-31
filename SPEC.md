@@ -17,16 +17,17 @@
 6. [DuckDB Integration](#duckdb-integration)
 7. [Analytics Buckets](#analytics-buckets)
 8. [Vector Buckets](#vector-buckets)
-9. [Access Patterns](#access-patterns)
-10. [Partner Integrations](#partner-integrations)
-11. [Governance](#governance)
-12. [Operational Considerations](#operational-considerations)
+9. [Edge Functions](#edge-functions)
+10. [REST API](#rest-api)
+11. [Partner Integrations](#partner-integrations)
+12. [Governance](#governance)
+13. [Operational Considerations](#operational-considerations)
 
 ---
 
 ## Overview
 
-Public Embedding Datasets provides pre-processed, versioned embedding datasets hosted in Supabase's Vector Buckets. The system enables instant RAG capabilities without requiring users to build data pipelines for crawling, chunking, or embedding.
+Public Embedding Datasets provides pre-processed, versioned embedding datasets hosted in S3-compatible buckets. The system enables instant RAG capabilities without requiring users to build data pipelines for crawling, chunking, or embedding.
 
 ### Prior Art
 
@@ -40,9 +41,9 @@ Public Embedding Datasets provides pre-processed, versioned embedding datasets h
 
 ### Goals
 
-- Ship public, versioned embedding datasets
-- Enable SQL-native querying via pgvector
-- Provide REST API access via PostgREST
+- Ship public, versioned embedding datasets in S3 buckets
+- Enable semantic search via Edge Functions
+- Provide REST API access for search queries
 - Support reproducible retrieval with immutable versions
 - Enable sponsorship model for dataset ingestion
 
@@ -77,16 +78,17 @@ Public Embedding Datasets provides pre-processed, versioned embedding datasets h
 └─────────────────────────────┼──────────────────────────────────────────────┘
                               │
 ┌─────────────────────────────┼──────────────────────────────────────────────┐
-│                             ▼            STORAGE LAYER                      │
+│                             ▼            STORAGE LAYER (S3)                 │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌────────────────────────────┐    ┌────────────────────────────┐          │
 │  │     Analytics Buckets      │    │      Vector Buckets        │          │
+│  │         (S3)               │    │         (S3)               │          │
 │  │                            │    │                            │          │
 │  │  • Raw crawl data          │    │  • Embedding vectors       │          │
 │  │  • Metadata/attribution    │    │  • Chunk content           │          │
-│  │  • Version snapshots       │    │  • HNSW/IVFFLAT indexes    │          │
-│  │  • Parquet format          │    │  • Similarity search       │          │
+│  │  • Version snapshots       │    │  • HNSW index files        │          │
+│  │  • Parquet format          │    │  • Parquet format          │          │
 │  │                            │    │                            │          │
 │  └────────────────────────────┘    └────────────────────────────┘          │
 │                                                                             │
@@ -96,10 +98,17 @@ Public Embedding Datasets provides pre-processed, versioned embedding datasets h
 │                             ▼            ACCESS LAYER                       │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                  │
-│  │     SQL      │    │  PostgREST   │    │    Edge      │                  │
-│  │  (pgvector)  │    │    (REST)    │    │  Functions   │                  │
-│  └──────────────┘    └──────────────┘    └──────────────┘                  │
+│                    ┌──────────────────────┐                                │
+│                    │    Edge Functions    │                                │
+│                    │   (Search Service)   │                                │
+│                    └──────────┬───────────┘                                │
+│                               │                                            │
+│              ┌────────────────┼────────────────┐                           │
+│              ▼                ▼                ▼                           │
+│       ┌──────────┐     ┌──────────┐     ┌──────────┐                      │
+│       │  REST    │     │   SDK    │     │  DuckDB  │                      │
+│       │   API    │     │  Client  │     │  Direct  │                      │
+│       └──────────┘     └──────────┘     └──────────┘                      │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -108,207 +117,105 @@ Public Embedding Datasets provides pre-processed, versioned embedding datasets h
 
 ## Dataset Registry
 
-### Schema
+The dataset registry is stored as JSON files in S3, providing metadata about all available datasets.
 
-```sql
-CREATE SCHEMA IF NOT EXISTS datasets;
+### Registry Structure
 
--- Core registry table
-CREATE TABLE datasets.registry (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name TEXT NOT NULL UNIQUE,
-    display_name TEXT NOT NULL,
-    description TEXT,
-
-    -- Versioning
-    current_version TEXT NOT NULL,
-    versions JSONB NOT NULL DEFAULT '[]',
-
-    -- Technical metadata
-    record_count BIGINT,
-    chunk_count BIGINT,
-    embedding_model TEXT NOT NULL,
-    embedding_dimensions INTEGER NOT NULL,
-    chunk_strategy TEXT, -- 'fixed', 'semantic', 'document'
-
-    -- Licensing
-    spdx_license TEXT NOT NULL,
-    license_url TEXT,
-    attribution_required BOOLEAN DEFAULT false,
-
-    -- Sponsorship
-    sponsor_name TEXT,
-    sponsor_url TEXT,
-    sponsor_logo_url TEXT,
-
-    -- Storage locations
-    analytics_bucket_path TEXT,
-    vector_bucket_path TEXT,
-
-    -- Checksums
-    checksum_sha256 TEXT,
-
-    -- Timestamps
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now(),
-    last_synced_at TIMESTAMPTZ
-);
-
--- Version history
-CREATE TABLE datasets.versions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    dataset_id UUID REFERENCES datasets.registry(id),
-    version TEXT NOT NULL,
-
-    -- Snapshot metadata
-    record_count BIGINT,
-    chunk_count BIGINT,
-    checksum_sha256 TEXT NOT NULL,
-
-    -- Storage
-    analytics_snapshot_path TEXT,
-    vector_snapshot_path TEXT,
-
-    -- Changelog
-    changelog TEXT,
-    breaking_changes BOOLEAN DEFAULT false,
-
-    created_at TIMESTAMPTZ DEFAULT now(),
-
-    UNIQUE(dataset_id, version)
-);
-
--- Per-record attribution (for mixed-license datasets)
-CREATE TABLE datasets.attributions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    dataset_id UUID REFERENCES datasets.registry(id),
-    record_id TEXT NOT NULL,
-
-    source_url TEXT,
-    author TEXT,
-    license TEXT,
-    attribution_text TEXT,
-
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-
--- Access tracking
-CREATE TABLE datasets.access_log (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    dataset_id UUID REFERENCES datasets.registry(id),
-    project_id UUID,
-
-    access_type TEXT, -- 'link', 'query', 'rest'
-    query_count INTEGER DEFAULT 1,
-
-    created_at TIMESTAMPTZ DEFAULT now()
-);
+```
+s3://datasets-registry/
+├── registry.json              # Master dataset list
+├── datasets/
+│   ├── oss-docs.json         # Per-dataset metadata
+│   ├── hacker-news.json
+│   └── arxiv-abstracts.json
+└── sponsors/
+    ├── firecrawl.json
+    └── protomaps.json
 ```
 
-### Registry Functions
+### Registry Schema: registry.json
 
-```sql
--- Link a dataset to a project
-CREATE OR REPLACE FUNCTION supabase.link_dataset(
-    dataset_name TEXT,
-    version TEXT DEFAULT 'latest'
-)
-RETURNS void
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_dataset RECORD;
-    v_version TEXT;
-    v_schema_name TEXT;
-BEGIN
-    -- Resolve dataset
-    SELECT * INTO v_dataset
-    FROM datasets.registry
-    WHERE name = dataset_name;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Dataset not found: %', dataset_name;
-    END IF;
-
-    -- Resolve version
-    IF version = 'latest' THEN
-        v_version := v_dataset.current_version;
-    ELSE
-        v_version := version;
-    END IF;
-
-    -- Create schema for dataset
-    v_schema_name := replace(dataset_name, '-', '_');
-    EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I', v_schema_name);
-
-    -- Create foreign tables pointing to vector bucket
-    EXECUTE format($q$
-        CREATE FOREIGN TABLE IF NOT EXISTS %I.chunks (
-            id UUID,
-            content TEXT,
-            embedding vector(%s),
-            metadata JSONB,
-            source_url TEXT,
-            chunk_index INTEGER,
-            created_at TIMESTAMPTZ
-        ) SERVER vector_bucket_server
-        OPTIONS (
-            bucket_path '%s',
-            version '%s'
-        )
-    $q$,
-        v_schema_name,
-        v_dataset.embedding_dimensions,
-        v_dataset.vector_bucket_path,
-        v_version
-    );
-
-    -- Log access
-    INSERT INTO datasets.access_log (dataset_id, access_type)
-    VALUES (v_dataset.id, 'link');
-END;
-$$;
-
--- List available versions
-CREATE OR REPLACE FUNCTION supabase.dataset_versions(dataset_name TEXT)
-RETURNS TABLE (
-    version TEXT,
-    record_count BIGINT,
-    created_at TIMESTAMPTZ,
-    changelog TEXT
-)
-LANGUAGE sql
-AS $$
-    SELECT v.version, v.record_count, v.created_at, v.changelog
-    FROM datasets.versions v
-    JOIN datasets.registry r ON r.id = v.dataset_id
-    WHERE r.name = dataset_name
-    ORDER BY v.created_at DESC;
-$$;
-
--- Get dataset metadata
-CREATE OR REPLACE FUNCTION supabase.dataset_metadata(dataset_name TEXT)
-RETURNS TABLE (
-    version TEXT,
-    record_count BIGINT,
-    embedding_model TEXT,
-    checksum TEXT,
-    created_at TIMESTAMPTZ,
-    sponsor TEXT
-)
-LANGUAGE sql
-AS $$
-    SELECT
-        current_version,
-        record_count,
-        embedding_model,
-        checksum_sha256,
-        updated_at,
-        sponsor_name
-    FROM datasets.registry
-    WHERE name = dataset_name;
-$$;
+```json
+{
+  "version": "1.0.0",
+  "updated_at": "2024-12-31T00:00:00Z",
+  "datasets": [
+    {
+      "name": "oss-docs",
+      "display_name": "OSS Documentation",
+      "current_version": "v2024.12.1",
+      "record_count": 2000000,
+      "license": "MIT",
+      "sponsor": "firecrawl"
+    }
+  ]
+}
 ```
+
+### Dataset Metadata Schema
+
+```json
+{
+  "name": "oss-docs",
+  "display_name": "OSS Documentation",
+  "description": "Documentation from popular open source projects",
+
+  "versioning": {
+    "current": "v2024.12.1",
+    "versions": [
+      {
+        "version": "v2024.12.1",
+        "created_at": "2024-12-31T00:00:00Z",
+        "record_count": 2000000,
+        "chunk_count": 8500000,
+        "checksum_sha256": "abc123...",
+        "changelog": "Added Next.js 15 documentation"
+      }
+    ]
+  },
+
+  "technical": {
+    "embedding_model": "text-embedding-3-small",
+    "embedding_dimensions": 1536,
+    "chunk_strategy": "semantic",
+    "chunk_size": 1000,
+    "chunk_overlap": 200
+  },
+
+  "licensing": {
+    "spdx_license": "MIT",
+    "license_url": "https://opensource.org/licenses/MIT",
+    "attribution_required": true
+  },
+
+  "sponsorship": {
+    "sponsor_name": "Firecrawl",
+    "sponsor_url": "https://firecrawl.dev",
+    "sponsor_logo_url": "https://firecrawl.dev/logo.svg"
+  },
+
+  "storage": {
+    "analytics_bucket": "s3://analytics-bucket/oss-docs/",
+    "vector_bucket": "s3://vector-bucket/oss-docs/"
+  }
+}
+```
+
+### Attributions Schema
+
+Per-record attribution for mixed-license datasets, stored as Parquet:
+
+```
+s3://analytics-bucket/{dataset}/attributions.parquet
+```
+
+| Column | Type | Description |
+|--------|------|-------------|
+| record_id | STRING | Unique chunk/document ID |
+| source_url | STRING | Original source URL |
+| author | STRING | Content author |
+| license | STRING | SPDX license identifier |
+| attribution_text | STRING | Required attribution text |
 
 ---
 
@@ -318,11 +225,11 @@ $$;
 
 ```
 ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
-│  Crawl   │───▶│  Clean   │───▶│  Chunk   │───▶│  Embed   │───▶│  Index   │
+│  Crawl   │───▶│  Clean   │───▶│  Chunk   │───▶│  Embed   │───▶│  Upload  │
 └──────────┘    └──────────┘    └──────────┘    └──────────┘    └──────────┘
      │               │               │               │               │
      ▼               ▼               ▼               ▼               ▼
-  Raw HTML      Markdown/Text    Chunks JSON    Vectors Parquet   HNSW Index
+  Raw HTML      Markdown/Text    Chunks JSON    Parquet+Vectors   S3 Buckets
 ```
 
 ### Stage Definitions
@@ -333,7 +240,7 @@ $$;
 | Clean | Raw content | Markdown/Text | Custom processors |
 | Chunk | Clean text | Chunk records | LangChain/Custom |
 | Embed | Chunks | Vector arrays | OpenAI/Voyage |
-| Index | Vectors | HNSW/IVFFLAT | pgvector |
+| Upload | Parquet files | S3 objects | DuckDB/AWS CLI |
 
 ---
 
@@ -461,7 +368,6 @@ Processes chunks from Analytics Bucket and writes to Vector Bucket.
 import duckdb
 import openai
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -469,7 +375,6 @@ import pyarrow.parquet as pq
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIMENSIONS = 1536
 BATCH_SIZE = 100
-MAX_WORKERS = 10
 
 # Initialize clients
 db = duckdb.connect()
@@ -666,16 +571,16 @@ Analytics Buckets store the raw and processed data in columnar format (Parquet) 
 ### Bucket Structure
 
 ```
-analytics-bucket/
+s3://analytics-bucket/
 ├── {dataset-name}/
 │   ├── {version}/
 │   │   ├── documents.parquet      # Full documents
-│   │   ├── chunks.parquet         # Chunked content
+│   │   ├── chunks.parquet         # Chunked content (no embeddings)
 │   │   ├── manifest.json          # Version metadata
 │   │   └── attributions.parquet   # Per-record licensing
-│   └── latest -> v2024.12.1/      # Symlink to current
+│   └── latest/                    # Symlink/copy to current version
 └── _registry/
-    └── datasets.parquet           # Global registry
+    └── datasets.json              # Global registry
 ```
 
 ### Parquet Schema: Documents
@@ -736,21 +641,23 @@ ORDER BY 1 DESC;
 
 ## Vector Buckets
 
-Vector Buckets store embedding vectors alongside chunk content, optimized for similarity search.
+Vector Buckets store embedding vectors alongside chunk content, optimized for retrieval via Edge Functions.
 
 ### Bucket Structure
 
 ```
-vector-bucket/
+s3://vector-bucket/
 ├── {dataset-name}/
 │   ├── {version}/
 │   │   ├── embeddings.parquet     # Vectors + content
-│   │   ├── index.hnsw             # HNSW index file
-│   │   └── manifest.json          # Index metadata
-│   └── latest -> v2024.12.1/
+│   │   ├── index/                 # Pre-built HNSW index
+│   │   │   ├── index.usearch      # USearch index file
+│   │   │   └── metadata.json      # Index parameters
+│   │   └── manifest.json          # Version metadata
+│   └── latest/
 └── _indexes/
-    └── hot/                       # Frequently accessed indexes
-        └── {dataset-name}.hnsw
+    └── hot/                       # Frequently accessed indexes (cached)
+        └── {dataset-name}/
 ```
 
 ### Parquet Schema: Embeddings
@@ -768,192 +675,452 @@ message Embedding {
 }
 ```
 
-### Loading into pgvector
+### Pre-built HNSW Index
 
-```sql
--- Create the target table
-CREATE TABLE oss_docs.chunks (
-    chunk_id UUID PRIMARY KEY,
-    doc_id UUID,
-    source_url TEXT,
-    chunk_content TEXT,
-    license TEXT,
-    chunk_index INTEGER,
-    embedding vector(1536),
-    metadata JSONB,
+Each dataset version includes a pre-built HNSW index for fast similarity search:
 
-    -- Indexing
-    created_at TIMESTAMPTZ DEFAULT now()
-);
+```python
+#!/usr/bin/env python3
+"""
+Build HNSW index from embeddings and upload to S3.
+"""
 
--- Create HNSW index for fast similarity search
-CREATE INDEX ON oss_docs.chunks
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+import usearch
+import numpy as np
+import pyarrow.parquet as pq
+import boto3
+import json
 
--- Load from Vector Bucket using postgres_fdw + parquet_fdw
-CREATE EXTENSION IF NOT EXISTS parquet_fdw;
+def build_index(dataset: str, version: str):
+    """Build and upload HNSW index."""
 
-CREATE SERVER vector_bucket_server
-FOREIGN DATA WRAPPER parquet_fdw;
+    # Load embeddings from Vector Bucket
+    table = pq.read_table(f's3://vector-bucket/{dataset}/{version}/embeddings.parquet')
+    df = table.to_pandas()
 
-CREATE FOREIGN TABLE oss_docs.chunks_external (
-    chunk_id TEXT,
-    doc_id TEXT,
-    source_url TEXT,
-    chunk_content TEXT,
-    license TEXT,
-    chunk_index INTEGER,
-    embedding REAL[]
-)
-SERVER vector_bucket_server
-OPTIONS (
-    filename 's3://vector-bucket/oss-docs/v2024.12.1/embeddings.parquet'
-);
+    embeddings = np.array(df['embedding'].tolist(), dtype=np.float32)
+    chunk_ids = df['chunk_id'].tolist()
 
--- Materialize into local table
-INSERT INTO oss_docs.chunks (
-    chunk_id, doc_id, source_url, chunk_content,
-    license, chunk_index, embedding
-)
-SELECT
-    chunk_id::UUID,
-    doc_id::UUID,
-    source_url,
-    chunk_content,
-    license,
-    chunk_index,
-    embedding::vector(1536)
-FROM oss_docs.chunks_external;
-```
+    # Build HNSW index
+    index = usearch.Index(
+        ndim=1536,
+        metric='cos',  # Cosine similarity
+        dtype='f32',
+        connectivity=16,  # M parameter
+        expansion_add=128,  # ef_construction
+        expansion_search=64  # ef_search
+    )
 
-### Similarity Search
+    # Add vectors with their chunk_id indices
+    for i, (chunk_id, embedding) in enumerate(zip(chunk_ids, embeddings)):
+        index.add(i, embedding)
 
-```sql
--- Function: Semantic search
-CREATE OR REPLACE FUNCTION oss_docs.search(
-    query_embedding vector(1536),
-    match_count INT DEFAULT 10,
-    filter_license TEXT DEFAULT NULL
-)
-RETURNS TABLE (
-    chunk_id UUID,
-    source_url TEXT,
-    chunk_content TEXT,
-    license TEXT,
-    similarity FLOAT
-)
-LANGUAGE sql
-AS $$
-    SELECT
-        chunk_id,
-        source_url,
-        chunk_content,
-        license,
-        1 - (embedding <=> query_embedding) AS similarity
-    FROM oss_docs.chunks
-    WHERE (filter_license IS NULL OR license = filter_license)
-    ORDER BY embedding <=> query_embedding
-    LIMIT match_count;
-$$;
+    # Save index locally
+    index.save(f'/tmp/{dataset}_{version}.usearch')
+
+    # Upload to S3
+    s3 = boto3.client('s3')
+    s3.upload_file(
+        f'/tmp/{dataset}_{version}.usearch',
+        'vector-bucket',
+        f'{dataset}/{version}/index/index.usearch'
+    )
+
+    # Upload metadata
+    metadata = {
+        'ndim': 1536,
+        'metric': 'cosine',
+        'connectivity': 16,
+        'vector_count': len(embeddings),
+        'chunk_ids': chunk_ids
+    }
+    s3.put_object(
+        Bucket='vector-bucket',
+        Key=f'{dataset}/{version}/index/metadata.json',
+        Body=json.dumps(metadata),
+        ContentType='application/json'
+    )
+
+if __name__ == "__main__":
+    build_index('oss-docs', 'v2024.12.1')
 ```
 
 ---
 
-## Access Patterns
+## Edge Functions
 
-### SQL Access (pgvector)
+Edge Functions provide the search API, loading indexes from S3 and performing similarity search.
 
-```sql
--- Link dataset to project
-SELECT supabase.link_dataset('oss-docs');
+### Search Edge Function
 
--- Semantic search
-SELECT * FROM oss_docs.search(
-    (SELECT embedding FROM embeddings WHERE id = 'query'),
-    10
-);
+```typescript
+// supabase/functions/dataset-search/index.ts
+import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
 
--- Full-text + vector hybrid search
-SELECT
-    c.chunk_content,
-    c.source_url,
-    1 - (c.embedding <=> query_embedding) AS vector_score,
-    ts_rank(to_tsvector(c.chunk_content), query) AS text_score
-FROM oss_docs.chunks c,
-     plainto_tsquery('postgresql indexes') query,
-     (SELECT embedding FROM embed('how do I create an index')) query_embedding
-WHERE to_tsvector(c.chunk_content) @@ query
-ORDER BY vector_score * 0.7 + text_score * 0.3 DESC
-LIMIT 10;
+// In-memory index cache
+const indexCache = new Map<string, { index: any; chunkIds: string[]; embeddings: Map<string, any> }>()
+
+interface SearchRequest {
+  query: string
+  dataset?: string
+  version?: string
+  limit?: number
+  filter?: {
+    license?: string[]
+  }
+}
+
+interface SearchResult {
+  chunk_id: string
+  content: string
+  source_url: string
+  similarity: number
+  license: string
+  metadata?: Record<string, any>
+}
+
+async function getEmbedding(text: string): Promise<number[]> {
+  const response = await fetch('https://api.openai.com/v1/embeddings', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${Deno.env.get('OPENAI_API_KEY')}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'text-embedding-3-small',
+      input: text,
+      dimensions: 1536,
+    }),
+  })
+
+  const data = await response.json()
+  return data.data[0].embedding
+}
+
+async function loadDataset(dataset: string, version: string) {
+  const cacheKey = `${dataset}:${version}`
+
+  if (indexCache.has(cacheKey)) {
+    return indexCache.get(cacheKey)!
+  }
+
+  // Load embeddings from S3
+  const s3Url = `https://vector-bucket.s3.amazonaws.com/${dataset}/${version}/embeddings.parquet`
+
+  // Using parquet-wasm for Deno
+  const { readParquet } = await import('https://esm.sh/parquet-wasm')
+  const response = await fetch(s3Url)
+  const buffer = await response.arrayBuffer()
+  const table = readParquet(new Uint8Array(buffer))
+
+  // Build in-memory structures
+  const chunkIds: string[] = []
+  const embeddings = new Map<string, { embedding: number[]; content: string; source_url: string; license: string }>()
+
+  for (const row of table) {
+    chunkIds.push(row.chunk_id)
+    embeddings.set(row.chunk_id, {
+      embedding: row.embedding,
+      content: row.chunk_content,
+      source_url: row.source_url,
+      license: row.license,
+    })
+  }
+
+  const cached = { index: null, chunkIds, embeddings }
+  indexCache.set(cacheKey, cached)
+
+  return cached
+}
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dotProduct = 0
+  let normA = 0
+  let normB = 0
+
+  for (let i = 0; i < a.length; i++) {
+    dotProduct += a[i] * b[i]
+    normA += a[i] * a[i]
+    normB += b[i] * b[i]
+  }
+
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB))
+}
+
+async function search(req: SearchRequest): Promise<SearchResult[]> {
+  const { query, dataset = 'oss-docs', version = 'latest', limit = 10, filter } = req
+
+  // Get query embedding
+  const queryEmbedding = await getEmbedding(query)
+
+  // Load dataset
+  const { embeddings } = await loadDataset(dataset, version)
+
+  // Calculate similarities
+  const results: SearchResult[] = []
+
+  for (const [chunkId, data] of embeddings) {
+    // Apply license filter
+    if (filter?.license && !filter.license.includes(data.license)) {
+      continue
+    }
+
+    const similarity = cosineSimilarity(queryEmbedding, data.embedding)
+
+    results.push({
+      chunk_id: chunkId,
+      content: data.content,
+      source_url: data.source_url,
+      similarity,
+      license: data.license,
+    })
+  }
+
+  // Sort by similarity and return top results
+  return results
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, limit)
+}
+
+serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, {
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      },
+    })
+  }
+
+  try {
+    const body: SearchRequest = await req.json()
+    const results = await search(body)
+
+    return new Response(JSON.stringify({ results }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      },
+    })
+  } catch (error) {
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+})
 ```
 
-### REST API Access
+### Optimized Search with USearch
 
-```bash
-# Search endpoint
-POST /datasets/v1/{dataset}/search
+For larger datasets, use pre-built HNSW indexes:
+
+```typescript
+// supabase/functions/dataset-search-hnsw/index.ts
+import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+
+// USearch WASM binding
+const usearch = await import('https://esm.sh/usearch')
+
+interface IndexCache {
+  index: any
+  chunkIds: string[]
+  contentMap: Map<string, any>
+}
+
+const indexCache = new Map<string, IndexCache>()
+
+async function loadIndex(dataset: string, version: string): Promise<IndexCache> {
+  const cacheKey = `${dataset}:${version}`
+
+  if (indexCache.has(cacheKey)) {
+    return indexCache.get(cacheKey)!
+  }
+
+  // Load pre-built index from S3
+  const indexUrl = `https://vector-bucket.s3.amazonaws.com/${dataset}/${version}/index/index.usearch`
+  const metadataUrl = `https://vector-bucket.s3.amazonaws.com/${dataset}/${version}/index/metadata.json`
+
+  const [indexResponse, metadataResponse] = await Promise.all([
+    fetch(indexUrl),
+    fetch(metadataUrl),
+  ])
+
+  const indexBuffer = await indexResponse.arrayBuffer()
+  const metadata = await metadataResponse.json()
+
+  // Load index
+  const index = new usearch.Index({
+    ndim: metadata.ndim,
+    metric: 'cos',
+    dtype: 'f32',
+  })
+  index.load(new Uint8Array(indexBuffer))
+
+  // Load content for results
+  const embeddingsUrl = `https://vector-bucket.s3.amazonaws.com/${dataset}/${version}/embeddings.parquet`
+  const { readParquet } = await import('https://esm.sh/parquet-wasm')
+  const embResponse = await fetch(embeddingsUrl)
+  const embBuffer = await embResponse.arrayBuffer()
+  const table = readParquet(new Uint8Array(embBuffer))
+
+  const contentMap = new Map()
+  for (const row of table) {
+    contentMap.set(row.chunk_id, {
+      content: row.chunk_content,
+      source_url: row.source_url,
+      license: row.license,
+    })
+  }
+
+  const cached = { index, chunkIds: metadata.chunk_ids, contentMap }
+  indexCache.set(cacheKey, cached)
+
+  return cached
+}
+
+async function searchWithIndex(
+  query: string,
+  dataset: string,
+  version: string,
+  limit: number
+) {
+  // Get query embedding
+  const queryEmbedding = await getEmbedding(query)
+
+  // Load index
+  const { index, chunkIds, contentMap } = await loadIndex(dataset, version)
+
+  // Search
+  const results = index.search(new Float32Array(queryEmbedding), limit)
+
+  // Map results to content
+  return results.keys.map((idx: number, i: number) => {
+    const chunkId = chunkIds[idx]
+    const data = contentMap.get(chunkId)
+
+    return {
+      chunk_id: chunkId,
+      content: data.content,
+      source_url: data.source_url,
+      similarity: 1 - results.distances[i], // Convert distance to similarity
+      license: data.license,
+    }
+  })
+}
+
+serve(async (req) => {
+  const { query, dataset = 'oss-docs', version = 'latest', limit = 10 } = await req.json()
+
+  const results = await searchWithIndex(query, dataset, version, limit)
+
+  return new Response(JSON.stringify({ results }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+---
+
+## REST API
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/datasets` | List all datasets |
+| GET | `/v1/{dataset}` | Get dataset metadata |
+| GET | `/v1/{dataset}/versions` | List versions |
+| POST | `/v1/{dataset}/search` | Semantic search |
+| GET | `/v1/{dataset}/download` | Get S3 URLs for direct access |
+
+### Search Request
+
+```http
+POST /v1/{dataset}/search
 Content-Type: application/json
+Authorization: Bearer {anon_key}
 
 {
-  "query": "how to create a table in PostgreSQL",
+  "query": "how to implement authentication",
   "limit": 10,
+  "version": "latest",
   "filter": {
     "license": ["MIT", "Apache-2.0"]
   },
   "include_embeddings": false
 }
+```
 
-# Response
+### Search Response
+
+```json
 {
   "results": [
     {
       "chunk_id": "abc123",
-      "content": "To create a table in PostgreSQL...",
-      "source_url": "https://postgresql.org/docs/...",
+      "content": "To implement authentication in your application...",
+      "source_url": "https://docs.example.com/auth",
       "similarity": 0.89,
-      "license": "PostgreSQL",
-      "metadata": {...}
+      "license": "MIT",
+      "metadata": {
+        "title": "Authentication Guide",
+        "section": "Getting Started"
+      }
     }
   ],
-  "usage": {
-    "tokens": 150,
-    "model": "text-embedding-3-small"
+  "meta": {
+    "dataset": "oss-docs",
+    "version": "v2024.12.1",
+    "query_time_ms": 45,
+    "total_chunks": 8500000
   }
 }
 ```
 
-### Edge Function Access
+### List Datasets
 
-```typescript
-// supabase/functions/rag-search/index.ts
-import { createClient } from '@supabase/supabase-js'
+```http
+GET /v1/datasets
+```
 
-Deno.serve(async (req) => {
-  const { query, dataset = 'oss-docs', limit = 10 } = await req.json()
+```json
+{
+  "datasets": [
+    {
+      "name": "oss-docs",
+      "display_name": "OSS Documentation",
+      "current_version": "v2024.12.1",
+      "record_count": 2000000,
+      "license": "MIT",
+      "sponsor": {
+        "name": "Firecrawl",
+        "url": "https://firecrawl.dev"
+      }
+    }
+  ]
+}
+```
 
-  const supabase = createClient(
-    Deno.env.get('SUPABASE_URL')!,
-    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
-  )
+### Download URLs
 
-  // Generate embedding
-  const { data: embedding } = await supabase.functions.invoke('embed', {
-    body: { text: query }
-  })
+```http
+GET /v1/{dataset}/download?version=v2024.12.1
+```
 
-  // Search dataset
-  const { data: results } = await supabase
-    .schema(dataset.replace('-', '_'))
-    .rpc('search', {
-      query_embedding: embedding,
-      match_count: limit
-    })
-
-  return new Response(JSON.stringify({ results }), {
-    headers: { 'Content-Type': 'application/json' }
-  })
-})
+```json
+{
+  "analytics": {
+    "documents": "https://analytics-bucket.s3.amazonaws.com/oss-docs/v2024.12.1/documents.parquet?...",
+    "chunks": "https://analytics-bucket.s3.amazonaws.com/oss-docs/v2024.12.1/chunks.parquet?..."
+  },
+  "vectors": {
+    "embeddings": "https://vector-bucket.s3.amazonaws.com/oss-docs/v2024.12.1/embeddings.parquet?...",
+    "index": "https://vector-bucket.s3.amazonaws.com/oss-docs/v2024.12.1/index/index.usearch?..."
+  },
+  "expires_at": "2024-12-31T01:00:00Z"
+}
 ```
 
 ---
@@ -995,9 +1162,10 @@ datasets:
 # firecrawl_pipeline.py
 from firecrawl import FirecrawlApp
 import duckdb
+import json
 
 def crawl_and_ingest(config):
-    """Firecrawl → DuckDB → Supabase Pipeline"""
+    """Firecrawl → DuckDB → S3 Pipeline"""
 
     app = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
 
@@ -1098,23 +1266,21 @@ All datasets must have SPDX-compliant license identifiers:
 | Creative Commons Zero | CC0-1.0 | Yes | No |
 | CC BY | CC-BY-4.0 | Yes | Required |
 | CC BY-NC | CC-BY-NC-4.0 | No | Required |
-| PostgreSQL | PostgreSQL | Yes | Required |
 | ODbL | ODbL-1.0 | Yes | Required (share-alike) |
 
 ### Per-Record Attribution
 
-For datasets with mixed licensing:
+For datasets with mixed licensing, attribution data is stored in `attributions.parquet`:
 
 ```sql
--- Query with attribution
+-- Query attributions via DuckDB
 SELECT
-    c.chunk_content,
-    c.source_url,
+    a.record_id,
+    a.source_url,
     a.license,
     a.attribution_text
-FROM oss_docs.chunks c
-LEFT JOIN datasets.attributions a ON c.chunk_id::text = a.record_id
-WHERE c.chunk_id = 'some-id';
+FROM read_parquet('s3://analytics-bucket/oss-docs/v2024.12.1/attributions.parquet') a
+WHERE a.record_id = 'chunk-123';
 ```
 
 ### Content Moderation
@@ -1135,7 +1301,6 @@ WHERE c.chunk_id = 'some-id';
 | oss-docs | Weekly | Full recrawl |
 | hacker-news | Daily | Incremental |
 | arxiv-abstracts | Daily | API sync |
-| postgres-mailing-lists | Daily | Incremental |
 | regulations | Monthly | Differential |
 
 ### Storage Estimates
@@ -1153,58 +1318,123 @@ Monthly Cost =
     Storage (GB) × $0.023/GB +
     Egress (GB) × $0.09/GB +
     Embedding API calls × $0.0001/1K tokens +
-    Index maintenance × compute hours
+    Edge Function invocations × $0.000002/invocation
 ```
 
 ### Monitoring
 
-```sql
--- Dataset health check
-SELECT
-    r.name,
-    r.current_version,
-    r.record_count,
-    r.last_synced_at,
-    CASE
-        WHEN r.last_synced_at < now() - interval '7 days' THEN 'stale'
-        ELSE 'healthy'
-    END AS status
-FROM datasets.registry r
-ORDER BY r.last_synced_at DESC;
+```python
+# monitoring.py - Dataset health checks
 
--- Access patterns
-SELECT
-    r.name,
-    date_trunc('day', a.created_at) AS day,
-    count(*) AS queries,
-    count(DISTINCT a.project_id) AS unique_projects
-FROM datasets.access_log a
-JOIN datasets.registry r ON r.id = a.dataset_id
-WHERE a.created_at > now() - interval '30 days'
-GROUP BY 1, 2
-ORDER BY 1, 2;
+import boto3
+import json
+from datetime import datetime, timedelta
+
+def check_dataset_health():
+    """Check all datasets for staleness and integrity."""
+
+    s3 = boto3.client('s3')
+
+    # Load registry
+    registry = json.loads(
+        s3.get_object(Bucket='datasets-registry', Key='registry.json')['Body'].read()
+    )
+
+    results = []
+    for dataset in registry['datasets']:
+        # Check last modified time
+        manifest = s3.head_object(
+            Bucket='vector-bucket',
+            Key=f"{dataset['name']}/{dataset['current_version']}/manifest.json"
+        )
+
+        last_modified = manifest['LastModified']
+        age_days = (datetime.now(last_modified.tzinfo) - last_modified).days
+
+        status = 'healthy' if age_days < 7 else 'stale'
+
+        results.append({
+            'dataset': dataset['name'],
+            'version': dataset['current_version'],
+            'last_modified': last_modified.isoformat(),
+            'age_days': age_days,
+            'status': status
+        })
+
+    return results
 ```
 
 ---
 
-## Appendix A: DuckDB Extension for Supabase
+## Appendix A: SDK Client
 
-Future: Native DuckDB extension for Supabase Vector Buckets.
+```typescript
+// @supabase/datasets SDK
 
-```sql
--- Proposed syntax
-INSTALL supabase FROM community;
-LOAD supabase;
+interface DatasetClient {
+  search(query: string, options?: SearchOptions): Promise<SearchResult[]>
+  getMetadata(): Promise<DatasetMetadata>
+  listVersions(): Promise<Version[]>
+  getDownloadUrls(version?: string): Promise<DownloadUrls>
+}
 
--- Configure connection
-CALL supabase_connect('https://project.supabase.co', 'service_role_key');
+interface SearchOptions {
+  limit?: number
+  version?: string
+  filter?: {
+    license?: string[]
+  }
+}
 
--- Query Vector Bucket directly
-SELECT * FROM supabase_vector_search(
-    bucket := 'oss-docs',
-    query := 'how to create an index',
-    limit := 10
-);
+export function createDatasetClient(
+  dataset: string,
+  options?: { baseUrl?: string; apiKey?: string }
+): DatasetClient {
+  const baseUrl = options?.baseUrl ?? 'https://datasets.supabase.co'
+  const apiKey = options?.apiKey ?? Deno.env.get('SUPABASE_ANON_KEY')
+
+  return {
+    async search(query: string, searchOptions?: SearchOptions) {
+      const response = await fetch(`${baseUrl}/v1/${dataset}/search`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({ query, ...searchOptions }),
+      })
+
+      const data = await response.json()
+      return data.results
+    },
+
+    async getMetadata() {
+      const response = await fetch(`${baseUrl}/v1/${dataset}`, {
+        headers: { 'Authorization': `Bearer ${apiKey}` },
+      })
+      return response.json()
+    },
+
+    async listVersions() {
+      const response = await fetch(`${baseUrl}/v1/${dataset}/versions`, {
+        headers: { 'Authorization': `Bearer ${apiKey}` },
+      })
+      return response.json()
+    },
+
+    async getDownloadUrls(version = 'latest') {
+      const response = await fetch(
+        `${baseUrl}/v1/${dataset}/download?version=${version}`,
+        { headers: { 'Authorization': `Bearer ${apiKey}` } }
+      )
+      return response.json()
+    },
+  }
+}
+
+// Usage
+const docs = createDatasetClient('oss-docs')
+const results = await docs.search('authentication', { limit: 5 })
 ```
 
 ---
