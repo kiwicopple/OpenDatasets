@@ -81,22 +81,17 @@ The included `postgres_mailing_lists.duckdb` contains 8 realistic sample message
 
 ```bash
 cd datasets/postgres-mailing-lists
-pip install requests beautifulsoup4 duckdb
-
-# Run scraper
-python scrape_to_duckdb.py
+uv run --with requests --with beautifulsoup4 --with duckdb scrape_to_duckdb.py
 
 # Check results
-python -c "import duckdb; print(duckdb.connect('postgres_mailing_lists.duckdb').execute('SELECT COUNT(*) FROM messages').fetchone())"
+uv run --with duckdb python -c "import duckdb; print(duckdb.connect('postgres_mailing_lists.duckdb').execute('SELECT COUNT(*) FROM messages').fetchone())"
 ```
 
 ### Option 2: With Firecrawl (better for JS-rendered content)
 
 ```bash
-pip install firecrawl-py duckdb
-
 export FIRECRAWL_API_KEY=fc-your-key-here
-python crawler.py
+uv run --with firecrawl-py --with duckdb crawler.py
 ```
 
 ## Query Examples
