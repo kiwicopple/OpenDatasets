@@ -22,13 +22,11 @@ python scrape_to_duckdb.py
 
 ## Files
 
-| File | Description | API Key Required |
-|------|-------------|------------------|
-| `postgres_mailing_lists.duckdb` | Sample database with 8 messages | - |
-| `scrape_to_duckdb.py` | Production scraper using requests/BeautifulSoup | ❌ No |
-| `crawler.py` | Alternative scraper using Firecrawl | ✅ Yes |
-| `scrape_sample.py` | Quick single-page test with Firecrawl | ✅ Yes |
-| `create_sample_db.py` | Generate sample data for testing | - |
+| File | Description |
+|------|-------------|
+| `postgres_mailing_lists.duckdb` | Sample database with 8 messages |
+| `scrape_to_duckdb.py` | Production scraper using requests/BeautifulSoup |
+| `create_sample_db.py` | Generate sample data for testing |
 
 ## Schema
 
@@ -77,21 +75,12 @@ The included `postgres_mailing_lists.duckdb` contains 8 realistic sample message
 
 ## Running the Scraper
 
-### Option 1: No API Key (requests + BeautifulSoup)
-
 ```bash
 cd datasets/postgres-mailing-lists
 uv run --with requests --with beautifulsoup4 --with duckdb scrape_to_duckdb.py
 
 # Check results
 uv run --with duckdb python -c "import duckdb; print(duckdb.connect('postgres_mailing_lists.duckdb').execute('SELECT COUNT(*) FROM messages').fetchone())"
-```
-
-### Option 2: With Firecrawl (better for JS-rendered content)
-
-```bash
-export FIRECRAWL_API_KEY=fc-your-key-here
-uv run --with firecrawl-py --with duckdb crawler.py
 ```
 
 ## Query Examples
