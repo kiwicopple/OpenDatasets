@@ -1,128 +1,154 @@
 # PostgreSQL Mailing Lists Dataset
 
-Pre-crawled, chunked PostgreSQL mailing list archives for RAG applications.
+Pre-crawled PostgreSQL mailing list archives for RAG applications.
 
 ## Status
 
-🚧 **In Progress** - Sample data available, production scraper ready for testing
+🚧 **In Progress** — Scraper ready, Iceberg integration complete.
 
 ## Quick Start
 
 ```bash
-# View sample data
-python -c "
-import duckdb
-conn = duckdb.connect('postgres_mailing_lists.duckdb')
-print(conn.execute('SELECT subject, author, date FROM messages LIMIT 5').fetchall())
-"
+cd datasets/postgres-mailing-lists
 
-# Run the scraper (no API key required)
-python scrape_to_duckdb.py
+# 1. Scrape to local DuckDB (for testing)
+uv run --with requests --with beautifulsoup4 --with duckdb 01_scrape_local.py
+
+# 2. View local data
+uv run --with duckdb python -c "
+import duckdb
+conn = duckdb.connect('data/messages.duckdb')
+print(conn.execute('SELECT subject, author FROM messages LIMIT 5').fetchall())
+"
 ```
 
-## Files
+## Scripts
 
-| File | Description |
-|------|-------------|
-| `postgres_mailing_lists.duckdb` | Sample database with 8 messages |
-| `scrape_to_duckdb.py` | Production scraper using requests/BeautifulSoup |
-| `create_sample_db.py` | Generate sample data for testing |
+| Script | Description |
+|--------|-------------|
+| `01_scrape_local.py` | Scrape to local DuckDB for verification |
+| `02_setup_iceberg.py` | Create namespace/table in Supabase Iceberg |
+| `03_scrape_iceberg.py` | Scrape directly to remote Iceberg bucket |
+
+## Workflow
+
+### Step 1: Local Testing
+
+Scrape a few messages to local DuckDB to verify everything works:
+
+```bash
+uv run --with requests --with beautifulsoup4 --with duckdb 01_scrape_local.py
+```
+
+Output: `./data/messages.duckdb`
+
+### Step 2: Configure Supabase
+
+Copy the environment template and add your Supabase credentials:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with your values:
+
+```bash
+AWS_ACCESS_KEY_ID=your_access_key
+AWS_SECRET_ACCESS_KEY=your_secret_key
+TOKEN=your_token
+WAREHOUSE=your_warehouse
+S3_ENDPOINT=https://xxx.supabase.co/storage/v1/s3
+CATALOG_URI=https://xxx.supabase.co/storage/v1/iceberg
+```
+
+### Step 3: Setup Iceberg
+
+Create the namespace and table in Supabase:
+
+```bash
+uv run --with pyiceberg --with python-dotenv 02_setup_iceberg.py
+```
+
+This creates:
+- Namespace: `postgres_mailing_lists`
+- Table: `postgres_mailing_lists.messages`
+
+### Step 4: Scrape to Iceberg
+
+Scrape messages directly to the remote Iceberg bucket:
+
+```bash
+# Scrape 10 messages (default)
+uv run --with pyiceberg --with python-dotenv --with requests --with beautifulsoup4 03_scrape_iceberg.py
+
+# Scrape more messages
+uv run --with pyiceberg --with python-dotenv --with requests --with beautifulsoup4 03_scrape_iceberg.py --limit 50
+```
 
 ## Schema
 
 ```sql
 CREATE TABLE messages (
-    id VARCHAR PRIMARY KEY,        -- Message ID from email headers
+    id VARCHAR PRIMARY KEY,        -- Message ID from URL
     message_id VARCHAR,            -- Full Message-ID header
     subject VARCHAR,               -- Email subject
-    author VARCHAR,                -- From header (name + email)
-    date TIMESTAMP,                -- Parsed date
+    author VARCHAR,                -- From header
+    date VARCHAR,                  -- Date string
+    date_parsed TIMESTAMP,         -- Parsed timestamp
     content TEXT,                  -- Full message body
     url VARCHAR,                   -- Archive URL
     thread_id VARCHAR,             -- Thread grouping ID
-    list_name VARCHAR,             -- Mailing list (e.g., 'pgsql-hackers')
-    crawled_at TIMESTAMP           -- When we scraped it
+    list_name VARCHAR,             -- Mailing list name
+    crawled_at TIMESTAMP           -- Scrape timestamp
 );
 ```
-
-## Sample Data
-
-The included `postgres_mailing_lists.duckdb` contains 8 realistic sample messages from pgsql-hackers covering:
-
-- Incremental materialized view proposals (Tom Lane, Andres Freund)
-- Hash join performance patches (David Rowley, Robert Haas)
-- JSON path improvements RFC (Alvaro Herrera)
-- Parallel query regression fixes (Amit Kapila, Thomas Munro)
-- Commitfest status updates (Michael Paquier)
 
 ## Data Source
 
 - **URL**: https://www.postgresql.org/list/pgsql-hackers/
 - **License**: PostgreSQL License (permissive)
-- **Update Frequency**: Daily (planned)
+- **Lists**: pgsql-hackers (more planned)
 
 ## TODO
 
-- [ ] Test `scrape_to_duckdb.py` on unrestricted network
-- [ ] Add pagination support to scrape historical archives
+- [ ] Add pagination to scrape historical archives
 - [ ] Parse email threading (In-Reply-To headers)
 - [ ] Extract structured metadata (patch attachments, commit refs)
 - [ ] Add chunking logic for embedding preparation
 - [ ] Generate embeddings with text-embedding-3-small
-- [ ] Export to Parquet for Vector Bucket upload
 - [ ] Add other lists: pgsql-general, pgsql-performance, pgsql-announce
-- [ ] Set up scheduled crawl job
-
-## Running the Scraper
-
-```bash
-cd datasets/postgres-mailing-lists
-uv run --with requests --with beautifulsoup4 --with duckdb scrape_to_duckdb.py
-
-# Check results
-uv run --with duckdb python -c "import duckdb; print(duckdb.connect('postgres_mailing_lists.duckdb').execute('SELECT COUNT(*) FROM messages').fetchone())"
-```
+- [ ] Set up scheduled crawl job (GitHub Actions)
 
 ## Query Examples
 
-```sql
--- Recent messages
-SELECT subject, author, date
-FROM messages
-ORDER BY date DESC
-LIMIT 10;
+Once data is in Iceberg, query via any Iceberg-compatible tool:
 
--- Messages by thread
-SELECT thread_id, COUNT(*) as msg_count, MIN(date) as started
-FROM messages
-GROUP BY thread_id
-ORDER BY started DESC;
+```python
+from pyiceberg.catalog import load_catalog
 
--- Search content
-SELECT subject, author, date
-FROM messages
-WHERE content ILIKE '%performance%'
-ORDER BY date DESC;
+catalog = load_catalog("supabase", ...)
+table = catalog.load_table("postgres_mailing_lists.messages")
 
--- Top contributors
-SELECT
-    split_part(author, '<', 1) as name,
-    COUNT(*) as messages
-FROM messages
-GROUP BY 1
-ORDER BY 2 DESC
-LIMIT 10;
+# Read all data
+df = table.scan().to_pandas()
+
+# Filter by author
+df = table.scan(
+    row_filter="author LIKE '%Tom Lane%'"
+).to_pandas()
 ```
 
-## Next Steps
+## Files
 
-Once the scraper is tested and we have real data:
-
-1. **Chunk** messages into ~1000 char segments with overlap
-2. **Embed** using OpenAI text-embedding-3-small (1536 dims)
-3. **Export** to Parquet format
-4. **Upload** to Vector Bucket at `s3://vector-bucket/postgres-mailing-lists/v{date}/`
-5. **Register** in dataset registry
+```
+├── .env.example           # Environment template (copy to .env)
+├── 01_scrape_local.py     # Local DuckDB scraper
+├── 02_setup_iceberg.py    # Iceberg namespace/table setup
+├── 03_scrape_iceberg.py   # Remote Iceberg scraper
+├── data/                  # Local data directory
+│   └── messages.duckdb    # Local DuckDB database
+└── README.md
+```
 
 ## License
 
