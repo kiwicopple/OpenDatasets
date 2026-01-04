@@ -38,7 +38,8 @@ chunker = Chunker(chunk_size=1000, overlap=200)
 │   ├── iceberg.py              # Supabase Analytics Buckets (PyIceberg)
 │   └── vector.py               # Supabase Vector Buckets (S3/Parquet)
 ├── datasets/                   # Individual datasets
-│   └── postgres-mailing-lists/ # PostgreSQL mailing list archives
+│   ├── postgres-mailing-lists/ # PostgreSQL mailing list archives
+│   └── hackernews/             # Hacker News stories and discussions
 └── SPEC.md                     # Technical specification
 ```
 
@@ -86,13 +87,13 @@ client.write_embeddings("my-dataset", "v1.0.0", table)
 | Dataset | Description | Status |
 |---------|-------------|--------|
 | [`postgres-mailing-lists`](./datasets/postgres-mailing-lists/) | PostgreSQL mailing list archives (pgsql-hackers) | 🚧 In Progress |
+| [`hackernews`](./datasets/hackernews/) | Hacker News stories and discussions | 🚧 In Progress |
 
 ### Planned
 
 | Dataset | Description | Source |
 |---------|-------------|--------|
 | `oss-docs` | OSS documentation (React, Vue, Next.js, etc.) | Web crawl |
-| `hacker-news` | HN stories and discussions | API |
 | `arxiv-abstracts` | arXiv paper abstracts | API |
 | `rfc-repository` | IETF RFCs, Rust RFCs, Python PEPs | Web crawl |
 
